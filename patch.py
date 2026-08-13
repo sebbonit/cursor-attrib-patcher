@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 MARKER = "cursor-attrib-patcher"
@@ -25,42 +26,85 @@ TRAILER_EMAIL = "cursoragent@cursor.com"
 TRAILER_LINE = "Co-authored-by: Cursor <cursoragent@cursor.com>"
 PR_FOOTER = "Made with [Cursor](https://cursor.com)"
 
+PatchReplacement = str | Callable[[re.Match[str]], str]
+
+
+def quoted_spaces(match: re.Match[str]) -> str:
+    """Replace a quoted/template literal with same-length spaces. Keeps JS valid and asar offsets intact."""
+    s = match.group(0)
+    if len(s) < 2:
+        return s
+    return s[0] + (" " * (len(s) - 2)) + s[-1]
+
+
+def same_length_spaces(match: re.Match[str]) -> str:
+    return " " * len(match.group(0))
+
+
+def same_length_false_if(match: re.Match[str]) -> str:
+    """Turn `if(t?.enable…)` into `if(false …)` without changing file length."""
+    s = match.group(0)
+    inner = "false"
+    pad = len(s) - len("if(") - len(inner) - len(")")
+    if pad < 0:
+        return s
+    return "if(" + inner + (" " * pad) + ")"
+
+
+def zero_ternary_flag(match: re.Match[str]) -> str:
+    """`flag:h?"enabled":void 0` → `flag:0?"enabled":void 0` (same length)."""
+    s = match.group(0)
+    return re.sub(r":(\w+)\?", lambda m: ":" + "0" + (" " * max(0, len(m.group(1)) - 1)) + "?", s, count=1)
+
+
 # Unique literals / stable minified shapes. Variable names change between builds.
-PATCHES: list[tuple[str, re.Pattern[str], str]] = [
+# Attribution payloads are blanked with same-length spaces (not deleted) so git/PR
+# get whitespace instead of Cursor text, and packed asar offsets stay valid.
+PATCHES: list[tuple[str, re.Pattern[str], PatchReplacement]] = [
+    (
+        "git-trailer-const",
+        re.compile(r'"Co-authored-by: Cursor <cursoragent@cursor\.com>"'),
+        quoted_spaces,
+    ),
     (
         "git-trailer-insert",
         re.compile(r'` --trailer "\$\{[A-Za-z_$][\w$]*\}"`'),
-        '""',
+        quoted_spaces,
     ),
     (
         "pr-footer-insert",
         re.compile(r'"\\n\\nMade with \[Cursor\]\(https://cursor\.com\)"'),
-        '""',
+        quoted_spaces,
+    ),
+    (
+        "pr-footer-text",
+        re.compile(r'"Made with \[Cursor\]\(https://cursor\.com\)"'),
+        quoted_spaces,
     ),
     (
         "legacy-made-with-trailer",
         re.compile(r' --trailer "Made-with: Cursor"'),
-        "",
+        same_length_spaces,
     ),
     (
         "disable-coauthor-gate",
-        re.compile(r"if\((\w+)\?\.enableCoAuthoredByTrailer\)"),
-        r"if(false&&\1?.enableCoAuthoredByTrailer)",
+        re.compile(r"if\(\w+\?\.enableCoAuthoredByTrailer\)"),
+        same_length_false_if,
     ),
     (
         "disable-pr-footer-gate",
-        re.compile(r"if\((\w+)\?\.enablePRGeneratedByFooter\)"),
-        r"if(false&&\1?.enablePRGeneratedByFooter)",
+        re.compile(r"if\(\w+\?\.enablePRGeneratedByFooter\)"),
+        same_length_false_if,
     ),
     (
         "commit-attribution-flag",
         re.compile(r"commitAttributionMessage:\w+\?\"enabled\":void 0"),
-        "commitAttributionMessage:void 0",
+        zero_ternary_flag,
     ),
     (
         "pr-attribution-flag",
         re.compile(r"prAttributionMessage:\w+\?\"enabled\":void 0"),
-        "prAttributionMessage:void 0",
+        zero_ternary_flag,
     ),
     (
         "default-commit-attr-off",
@@ -73,6 +117,21 @@ PATCHES: list[tuple[str, re.Pattern[str], str]] = [
         r"\g<1>1",
     ),
 ]
+
+# Same-length blanks applied to asar bytes (archive, not encryption).
+ASAR_BLANK_NEEDLES: tuple[tuple[str, bytes], ...] = (
+    ("git-trailer-const", TRAILER_LINE.encode("utf-8")),
+    ("pr-footer-text", PR_FOOTER.encode("utf-8")),
+)
+
+ASAR_RELATIVE = (
+    "Contents/Resources/app.asar",
+    "Contents/Resources/app/node_modules.asar",
+    "resources/app.asar",
+    "resources/app/node_modules.asar",
+    "app.asar",
+    "node_modules.asar",
+)
 
 SCAN_MARKERS = (
     TRAILER_EMAIL.encode(),
@@ -317,6 +376,8 @@ def file_looks_relevant(path: Path) -> bool:
 def classify(path: Path) -> str:
     text = str(path).replace("\\", "/")
     lower = text.lower()
+    if path.suffix.lower() == ".asar":
+        return "asar"
     if "cursor-agent-exec" in lower or "cursor-agent-host" in lower or "cursor-local-agent-runtime" in lower:
         return "ide-agent"
     if "workbench" in lower:
@@ -326,6 +387,82 @@ def classify(path: Path) -> str:
     if "/Contents/Resources/app/" in text or "/resources/app/" in lower:
         return "ide"
     return "unknown"
+
+
+def asar_search_roots(root: Path) -> list[Path]:
+    if root.is_dir() and root.name in {"Applications"}:
+        try:
+            return [
+                child
+                for child in root.iterdir()
+                if child.suffix == ".app" and "ursor" in child.name
+            ]
+        except OSError:
+            return []
+    return [root]
+
+
+def find_asars(root: Path, max_depth: int = 8) -> list[Path]:
+    found: list[Path] = []
+    for base in asar_search_roots(root):
+        found.extend(_find_asars_in(base, max_depth=max_depth))
+    return found
+
+
+def _find_asars_in(root: Path, max_depth: int = 8) -> list[Path]:
+    found: list[Path] = []
+    if root.is_file() and root.suffix.lower() == ".asar":
+        return [root]
+    if not root.is_dir():
+        return []
+    for rel in ASAR_RELATIVE:
+        candidate = root / rel
+        if candidate.is_file():
+            found.append(candidate)
+    skip_dirs = {
+        "node_modules",
+        ".git",
+        "Cache",
+        "CachedData",
+        "GPUCache",
+        "Code Cache",
+        "CachedExtensions",
+        "logs",
+    }
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            rel = Path(dirpath)
+            try:
+                depth = len(rel.relative_to(root).parts)
+            except ValueError:
+                depth = 0
+            if depth >= max_depth:
+                dirnames.clear()
+                continue
+            dirnames[:] = [name for name in dirnames if name not in skip_dirs]
+            for name in filenames:
+                if name.endswith(".asar"):
+                    found.append(Path(dirpath) / name)
+    except OSError:
+        pass
+    return found
+
+
+def blank_bytes(data: bytes) -> tuple[bytes, list[str]]:
+    applied: list[str] = []
+    for name, needle in ASAR_BLANK_NEEDLES:
+        count = data.count(needle)
+        if not count:
+            continue
+        data = data.replace(needle, b" " * len(needle))
+        applied.append(f"{name} x{count}")
+    return data, applied
+
+
+def asar_looks_relevant(data: bytes) -> bool:
+    return any(marker in data for marker in SCAN_MARKERS) or any(
+        needle in data for _name, needle in ASAR_BLANK_NEEDLES
+    )
 
 
 def load_manifest() -> dict:
@@ -366,19 +503,22 @@ def apply_patches(text: str) -> tuple[str, list[str]]:
     return text, applied
 
 
+def js_needs_patch(text: str) -> tuple[bool, list[str]]:
+    updated, applied = apply_patches(text)
+    return updated != text, applied
+
+
 def is_already_patched(text: str) -> bool:
-    if '""' in text and TRAILER_LINE in text:
-        # Trailer constant may remain for alreadyModified checks; insert must be gone.
-        if re.search(r'` --trailer "\$\{[A-Za-z_$][\w$]*\}"`', text):
-            return False
-        if "enableCoAuthoredByTrailer" in text and "false&&" not in text and "commitAttributionMessage:void 0" not in text:
-            # Still has a live gate and live flag somewhere.
-            if re.search(r"if\(\w+\?\.enableCoAuthoredByTrailer\)", text):
-                return False
-        return True
-    if "commitAttributionMessage:void 0" in text and "prAttributionMessage:void 0" in text:
-        return True
-    return False
+    needs, _applied = js_needs_patch(text)
+    if needs:
+        return False
+    return (
+        "commitAttributionMessage:void 0" in text
+        or "commitAttributionMessage:0?" in text
+        or "false&&" in text
+        or 'if(false' in text
+        or f'"{TRAILER_LINE}"' not in text
+    )
 
 
 def enclosing_app(path: Path) -> Path | None:
@@ -637,6 +777,23 @@ def discover() -> list[Path]:
     return found
 
 
+def discover_asars() -> list[Path]:
+    found: list[Path] = []
+    seen: set[str] = set()
+    for root in candidate_roots():
+        for asar in find_asars(root):
+            try:
+                key = str(asar.resolve())
+            except OSError:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(asar)
+    found.sort()
+    return found
+
+
 def patch_cli_config(dry_run: bool) -> bool:
     config = home() / ".cursor" / "cli-config.json"
     if not config.is_file():
@@ -659,33 +816,95 @@ def patch_cli_config(dry_run: bool) -> bool:
     return True
 
 
-def cmd_status() -> int:
-    files = discover()
-    if not files:
-        print("No Cursor attribution injectors found.")
-        return 1
-    patched = 0
+def _backup_file(path: Path, manifest: dict, surface: str) -> None:
+    if str(path.resolve()) in manifest.get("files", {}):
+        return
+    backup = backup_path_for(path)
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, backup)
+    manifest.setdefault("files", {})[str(path.resolve())] = {
+        "backup": str(backup),
+        "surface": surface,
+    }
+
+
+def cmd_detect(*, verbose: bool = False) -> int:
+    """Report whether any local Cursor install still injects attribution."""
+    js_files = discover()
+    asars = discover_asars()
+
     dirty = 0
-    for path in files:
+    patched = 0
+    clean_asars = 0
+    stub_asars = 0
+
+    print("== JavaScript ==")
+    if not js_files:
+        print("  no attribution injectors found in unpacked JS")
+    for path in js_files:
         text = path.read_text(encoding="utf-8", errors="ignore")
-        updated, applied = apply_patches(text)
-        already = is_already_patched(text)
-        if not applied and not already:
-            continue
-        if already or updated == text:
-            state = "patched"
-            patched += 1
-        else:
-            state = "LIVE"
+        needs, applied = js_needs_patch(text)
+        if needs:
+            state = "NEED"
             dirty += 1
-        print(f"[{state:7}] {classify(path):13} {path}")
-    print(f"\n{dirty} still injecting, {patched} patched.")
-    return 0 if dirty == 0 else 2
+        else:
+            state = "ok"
+            patched += 1
+        if needs or verbose:
+            extra = f"  ({', '.join(applied)})" if needs and applied else ""
+            print(f"  [{state:4}] {classify(path):13} {path}{extra}")
+    if not verbose and patched:
+        print(f"  {patched} file(s) already patched")
+
+    print("\n== Packed archives (.asar) ==")
+    print("  Electron asar is an archive, not encryption. Same-length blanks keep offsets valid.")
+    if not asars:
+        print("  no .asar files found (this Cursor build likely ships unpacked JS)")
+    for path in asars:
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            print(f"  [err ] asar          {path}  ({exc})")
+            continue
+        size = len(data)
+        if size < 1024:
+            stub_asars += 1
+            print(f"  [stub] asar          {path}  ({size} bytes, pointer/stub)")
+            continue
+        _updated, applied = blank_bytes(data)
+        relevant = asar_looks_relevant(data)
+        if applied:
+            dirty += 1
+            print(f"  [NEED] asar          {path}  ({size} bytes; {', '.join(applied)})")
+        elif relevant:
+            patched += 1
+            print(f"  [ok  ] asar          {path}  ({size} bytes, markers present, already blanked)")
+        else:
+            clean_asars += 1
+            print(f"  [clean] asar         {path}  ({size} bytes, no attribution markers)")
+
+    print("\n== Summary ==")
+    print(f"  {dirty} still need patching, {patched} already patched, {clean_asars} clean asar(s), {stub_asars} asar stub(s).")
+    if dirty:
+        print("  Needs patching: YES")
+        print("  Run: python3 patch.py")
+        return 2
+    if not js_files and not asars:
+        print("  Needs patching: UNKNOWN (no Cursor injectors or archives found)")
+        print("  Set CURSOR_ATTRIB_PATCHER_PATHS to extra install dirs if needed.")
+        return 1
+    print("  Needs patching: NO")
+    return 0
+
+
+def cmd_status() -> int:
+    return cmd_detect(verbose=True)
 
 
 def cmd_patch(dry_run: bool, restart: bool = True) -> int:
     files = discover()
-    if not files:
+    asars = discover_asars()
+    if not files and not asars:
         print("No Cursor attribution injectors found.")
         print("Set CURSOR_ATTRIB_PATCHER_PATHS to extra install dirs if needed.")
         return 1
@@ -714,17 +933,44 @@ def cmd_patch(dry_run: bool, restart: bool = True) -> int:
                 apps.add(app)
             continue
 
-        backup = backup_path_for(path)
-        if str(path.resolve()) not in manifest.get("files", {}):
-            backup.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, backup)
-            manifest.setdefault("files", {})[str(path.resolve())] = {
-                "backup": str(backup),
-                "surface": rel,
-            }
+        _backup_file(path, manifest, rel)
         try:
             ensure_writable(path)
             path.write_text(updated, encoding="utf-8")
+        except PermissionError:
+            blocked.append(path)
+            changed_files -= 1
+            print("         blocked by macOS (App Management). Run this from Terminal.app.")
+            continue
+        app = enclosing_app(path)
+        if app:
+            apps.add(app)
+
+    for path in asars:
+        try:
+            original = path.read_bytes()
+        except OSError:
+            continue
+        if len(original) < 1024:
+            unchanged += 1
+            continue
+        updated, applied = blank_bytes(original)
+        if not applied or updated == original:
+            unchanged += 1
+            continue
+        print(f"[{'dry' if dry_run else 'patch'}] asar          {path}")
+        for item in applied:
+            print(f"         {item}")
+        changed_files += 1
+        if dry_run:
+            app = enclosing_app(path)
+            if app:
+                apps.add(app)
+            continue
+        _backup_file(path, manifest, "asar")
+        try:
+            ensure_writable(path)
+            path.write_bytes(updated)
         except PermissionError:
             blocked.append(path)
             changed_files -= 1
@@ -802,8 +1048,8 @@ def main() -> int:
         "command",
         nargs="?",
         default="patch",
-        choices=("patch", "status", "restore", "scan", "restart"),
-        help="patch (default), status, restore, restart CLIs, or scan",
+        choices=("patch", "detect", "status", "restore", "scan", "restart"),
+        help="patch (default), detect, status, restore, restart CLIs, or scan",
     )
     parser.add_argument("--dry-run", action="store_true", help="show what would change")
     parser.add_argument(
@@ -813,6 +1059,8 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.command == "detect":
+        return cmd_detect()
     if args.command in {"status", "scan"}:
         return cmd_status()
     if args.command == "restart":
