@@ -26,7 +26,8 @@ cd cursor-attrib-patcher
 ## Usage
 
 ```bash
-python3 patch.py status      # show detected installs and patch state
+python3 patch.py detect      # check whether Cursor still needs patching
+python3 patch.py status      # alias of detect
 python3 patch.py --dry-run   # show what would change
 python3 patch.py             # patch everything found, then restart CLIs
 python3 patch.py restore     # restore originals from backups
@@ -42,10 +43,13 @@ After patching, fully quit and reopen the Cursor IDE so it loads the patched JS.
 
 | Command | What it does |
 |---|---|
-| `status` | Detect Cursor IDE/CLI files and report `LIVE` vs `patched` |
+| `detect` | Scan unpacked JS **and** `.asar` archives; print files that still need a patch and `Needs patching: YES/NO` |
+| `status` / `scan` | Same scan, listing every matched file |
 | `patch` (default) | Patch injectors, set CLI attribution flags off, re-sign the macOS app, restart CLIs |
 | `restore` | Copy backed-up originals back and re-sign |
 | `restart` | Stop running `cursor-agent` processes so they reload |
+
+Exit codes for `detect`: `0` already patched, `2` needs patching, `1` nothing found.
 
 ## What it finds
 
@@ -59,18 +63,23 @@ Extra paths:
 
 ```bash
 export CURSOR_ATTRIB_PATCHER_PATHS="/path/to/Cursor.app:/other/install"
-python3 patch.py
+python3 patch.py detect
 ```
+
+## Packed files (asar)
+
+Electron `.asar` files are **archives, not encryption**. Current Cursor macOS builds ship most JS unpacked; `node_modules.asar` is often a tiny stub pointing at the unpacked `node_modules` folder.
+
+`detect` still scans every `.asar` under Cursor installs. If a live injector is inside an archive, `patch` blanks it in place with **same-length spaces** so the asar file-offset header stays valid. V8 snapshots and Chromium `.pak` files on this build do not contain the git/PR attribution strings.
 
 ## What it changes
 
-In Cursor's own JavaScript it:
+Attribution **text is not deleted**. The payload strings are replaced with the same number of spaces, so:
 
-- Clears the `git commit --trailer` insert
-- Clears the `Made with Cursor` PR footer insert
-- Forces the co-author / PR-footer gates off
-- Stops sending `commitAttributionMessage: "enabled"`
-- Defaults missing attribution config to off
+- `git commit` would get a blank `--trailer` value instead of `Co-authored-by: Cursor <…>`
+- PR bodies would get whitespace instead of `Made with [Cursor](https://cursor.com)`
+
+The injector gates and `commitAttributionMessage` / `prAttributionMessage` flags are forced off as well (also same-length where possible). Short `includes("Co-authored-by: Cursor")` checks are left alone so already-attributed commands are still skipped.
 
 It also sets `~/.cursor/cli-config.json`:
 
@@ -101,7 +110,7 @@ If a Cursor/agent session cannot write into the app bundle, run the same command
 
 ## After a Cursor update
 
-Updates overwrite the JS. Run `python3 patch.py` again.
+Updates overwrite the JS. Run `python3 patch.py detect`, then `python3 patch.py` if it says `Needs patching: YES`.
 
 ## Restore
 
@@ -112,7 +121,7 @@ python3 patch.py restore
 ## Limitations
 
 - Local IDE and CLI only. Cloud/background agents still attribute on Cursor's servers.
-- A new Cursor build can move or rename the injector. `python3 patch.py status` shows whether it still matches.
+- A new Cursor build can move or rename the injector. `python3 patch.py detect` shows whether it still matches.
 - This modifies files inside your Cursor install. Use at your own risk.
 
 ## License
