@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -883,6 +884,19 @@ def cmd_detect(*, verbose: bool = False) -> int:
             clean_asars += 1
             print(f"  [clean] asar         {path}  ({size} bytes, no attribution markers)")
 
+    print("\n== product.json checksums ==")
+    stale_roots = 0
+    for root in sorted(product_roots_for(js_files)):
+        stale = stale_product_checksums(root)
+        if not stale:
+            continue
+        dirty += len(stale)
+        stale_roots += 1
+        print(f"  [NEED] checksums     {root / 'product.json'}")
+        print(f"         patched but digest not refreshed: {', '.join(sorted(stale))}")
+    if not stale_roots and js_files:
+        print("  ok (no stale digests for patched files)")
+
     print("\n== Summary ==")
     print(f"  {dirty} still need patching, {patched} already patched, {clean_asars} clean asar(s), {stub_asars} asar stub(s).")
     if dirty:
@@ -901,6 +915,112 @@ def cmd_status() -> int:
     return cmd_detect(verbose=True)
 
 
+def file_checksum(path: Path) -> str:
+    """Mirror Cursor's IntegrityService: sha256 -> base64, trailing '=' stripped."""
+    digest = hashlib.sha256(path.read_bytes()).digest()
+    return base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def product_root_for(path: Path) -> Path | None:
+    for parent in path.parents:
+        if (parent / "product.json").is_file() and (parent / "out").is_dir():
+            return parent
+    return None
+
+
+def stale_product_checksums(root: Path) -> list[str]:
+    """Checksum keys whose on-disk file is patched but no longer matches product.json."""
+    product = root / "product.json"
+    try:
+        data = json.loads(product.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    checksums = data.get("checksums")
+    if not isinstance(checksums, dict):
+        return []
+    stale: list[str] = []
+    for rel, expected in checksums.items():
+        target = root / "out" / rel
+        if not target.is_file():
+            continue
+        try:
+            if file_checksum(target) == expected:
+                continue
+            text = target.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if target.suffix == ".js" and is_already_patched(text):
+            stale.append(rel)
+    return stale
+
+
+def product_roots_for(paths) -> set[Path]:
+    roots: set[Path] = set()
+    for path in paths:
+        root = product_root_for(Path(path))
+        if root:
+            roots.add(root)
+    return roots
+
+
+def update_product_checksums(
+    patched: set[str], manifest: dict, dry_run: bool
+) -> tuple[bool, int]:
+    """Rewrite product.json checksums for files we patched (now or previously).
+
+    Cursor (via VS Code's IntegrityService) hashes the files listed in
+    product.json "checksums" at startup and shows "Your Cursor installation
+    appears to be corrupt" on mismatch. Refreshing the digests for files we
+    blanked keeps that check green.
+
+    Returns (changed_any, blocked_paths).
+    """
+    roots = product_roots_for(patched)
+
+    changed_any = False
+    blocked_paths: list[Path] = []
+    for product in sorted(roots):
+        product = product / "product.json"
+        try:
+            data = json.loads(product.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        checksums = data.get("checksums")
+        if not isinstance(checksums, dict):
+            continue
+        stale = set(stale_product_checksums(product.parent))
+        changed = False
+        for rel in list(checksums):
+            target = product.parent / "out" / rel
+            try:
+                resolved = str(target.resolve())
+            except OSError:
+                continue
+            if resolved not in patched and rel not in stale:
+                continue
+            try:
+                actual = file_checksum(target)
+            except OSError:
+                continue
+            if actual != checksums[rel]:
+                checksums[rel] = actual
+                changed = True
+        if not changed:
+            continue
+        print(f"[{'dry' if dry_run else 'patch'}] checksums     {product}")
+        changed_any = True
+        if dry_run:
+            continue
+        _backup_file(product, manifest, "product-checksums")
+        try:
+            ensure_writable(product)
+            product.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        except PermissionError:
+            blocked_paths.append(product)
+            print("         blocked by macOS (App Management). Run this from Terminal.app.")
+    return changed_any, blocked_paths
+
+
 def cmd_patch(dry_run: bool, restart: bool = True) -> int:
     files = discover()
     asars = discover_asars()
@@ -911,6 +1031,7 @@ def cmd_patch(dry_run: bool, restart: bool = True) -> int:
 
     manifest = load_manifest()
     apps: set[Path] = set()
+    patched_paths: set[str] = set()
     changed_files = 0
     unchanged = 0
     blocked: list[Path] = []
@@ -942,6 +1063,7 @@ def cmd_patch(dry_run: bool, restart: bool = True) -> int:
             changed_files -= 1
             print("         blocked by macOS (App Management). Run this from Terminal.app.")
             continue
+        patched_paths.add(str(path.resolve()))
         app = enclosing_app(path)
         if app:
             apps.add(app)
@@ -976,11 +1098,16 @@ def cmd_patch(dry_run: bool, restart: bool = True) -> int:
             changed_files -= 1
             print("         blocked by macOS (App Management). Run this from Terminal.app.")
             continue
+        patched_paths.add(str(path.resolve()))
         app = enclosing_app(path)
         if app:
             apps.add(app)
 
     cli_config_changed = patch_cli_config(dry_run)
+    checksums_updated, checksums_blocked = update_product_checksums(
+        patched_paths | {str(f) for f in files}, manifest, dry_run
+    )
+    blocked.extend(checksums_blocked)
     if not dry_run:
         save_manifest(manifest)
         resign_macos_apps(apps, dry_run=False)
@@ -992,6 +1119,7 @@ def cmd_patch(dry_run: bool, restart: bool = True) -> int:
         f"\n{'Would patch' if dry_run else 'Patched'} {changed_files} file(s), "
         f"{unchanged} unchanged."
         + (" CLI config attribution flags set to false." if cli_config_changed else "")
+        + (" product.json checksums refreshed." if checksums_updated and not checksums_blocked else "")
     )
     if changed_files and not dry_run and not restart:
         print("Restart Cursor and cursor-agent for the patch to take effect.")

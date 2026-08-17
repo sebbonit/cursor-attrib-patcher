@@ -108,6 +108,12 @@ The app is re-signed ad-hoc after editing. Gatekeeper may warn that Cursor was m
 
 If a Cursor/agent session cannot write into the app bundle, run the same command in **Terminal.app**.
 
+## The "installation appears to be corrupt" warning
+
+Cursor inherits VS Code's `IntegrityService`: at startup it SHA-256-hashes the files listed under `checksums` in `product.json` (`workbench.desktop.main.js` among them) and shows **"Your Cursor installation appears to be corrupt"** when a digest no longer matches. The check is advisory only — the IDE keeps working.
+
+Since the patcher intentionally rewrites those files, it also refreshes the affected entries in `product.json` so the check stays green. `detect` reports stale digests (`[NEED] checksums …`) if the files were patched but `product.json` was not updated, which happens for installs patched by older versions of this tool.
+
 ## After a Cursor update
 
 Updates overwrite the JS. Run `python3 patch.py detect`, then `python3 patch.py` if it says `Needs patching: YES`.
